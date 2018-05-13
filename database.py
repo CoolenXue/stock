@@ -4,6 +4,8 @@ import tushare as ts
 import pymysql as mysql
 import numpy
 import os
+import sys
+import datetime
 # DateFrame:
 #       index 	The index (row labels) of the DataFrame.
 #       columns	The column labels of the DataFrame.
@@ -108,11 +110,25 @@ __database__ = 'stock'
 __charset__ = 'utf8'
 
 class Database():
-    def __init__(self):
+    def __init__(self, log = None):
         self.db = mysql.connect(host = __host__, user = __user__, password = __password__, database = __database__, charset = __charset__)
         self.cursor = self.db.cursor()
+        if log:
+            if os.path.exists(log):
+                os.remove(log)
+            self.log = open(log,  'a')
+        else:
+            self.log = sys.stdout
+
+        self.debug_files = {'stock':'stock.dbg', 'trade':'trade.dbg', 'company':'company.dbg'}
+        self.debug_en = False
 
     def update(self):
+        logs = [item for item in self.debug_files.values()]
+        for log in logs:
+            if os.path.exists(log):
+                os.remove(log)
+
         self._check_table_stock()
         self._check_table_trade()
         self._check_table_company()
@@ -120,120 +136,92 @@ class Database():
     def execute(self, sql):
         self.cursor.execute(sql)
         return self.cursor.fetchall()
-    
+
     def _check_table_stock(self):
         try:
             df = ts.get_stock_basics()
         except Exception as e:
-            print('[ERR]:', e) 
-            print('[ERR]: get_stock_basics fail')
+            print('[ERR]:', e, file = self.log) 
+            print('[ERR]: get_stock_basics fail.' % e, file = self.log) 
             quit()
 
-        self.cursor.execute('desc stock;')
-        columns_group = self.cursor.fetchall()
-
-        fmt_proc = lambda x, y: '\'%%(%s)s\'' % x if y.startswith('varchar') else '%%(%s)s' % x
-        values_fmt = '(%s)' % ', '.join(fmt_proc(item[0], item[1]) for item in columns_group)
+        if df.empty:
+            print('[ERR]: get_stock_basics is empty', file = self.log)
+            quit()
 
         def dict_fix(idx):
             ret = df.ix[idx].to_dict()
             ret['code'] = idx
             return ret
-        values_list = ', '.join(values_fmt % dict_fix(idx) for idx in df.index)
-
-        log_filename = 'D:\\log_stock.txt'
-        #if os.path.exists(log_filename):
-        #    os.remove(log_filename)
-
-        with open(log_filename, 'w') as fp:
-            print('\n\n\n\n##### [stock]: insert %d records ######\n' % df.shape[0], 
-                    '\ndf\n', df, 
-                    '\nvalues_list\n', values_list, 
-                    file = fp)
+        dict_list = [dict_fix(idx) for idx in df.index]
 
         self.cursor.execute('delete from stock;')
-
-        try:
-            self.cursor.execute('insert into stock values %s;' % values_list)
-            self.db.commit()
-        except Exception as e:
-            self.db.rollback()
-            print('[ERR]:', e)
-            print('[ERR]: commit stock insert fail')
-            quit()
-        else:
-            print('[stock]: insert %d records' % df.shape[0])
+        self._insert_into_table('stock', dict_list)
 
     def _check_table_trade(self):
-        columns_group = self.execute('desc trade')
         code_list = [item[0] for item in self.execute('select code from stock;')]
+        idx_offset = self.execute('select max(id) from trade;')[0][0]
+        idx_offset = idx_offset + 1 if idx_offset else 0
 
-        idx_offset = 0
         for code in code_list:
+            last_date = self.execute('select max(date) from trade where code = %s;' % code)[0][0]
+            if last_date:
+                start_date = str(last_date + datetime.timedelta(days = 1))
+            else:
+                start_date = ''
+
             try:
-                df = ts.get_k_data(code, ktype = 'W')
+                df = ts.get_k_data(code, start = start_date, ktype = 'W')
             except Exception as e:
-                print('[ERR]:', e)
-                print('[ERR]: get_k_data for %s fail' % code)
+                print('[ERR]:', e, file = self.log)
+                print('[ERR]: get_k_data for %s fail' % code, file = self.log)
                 quit()
             
             if df.empty:
-                print('[WARING]: %s k_data is empty' % code)
+                print('[WARING]: %s k_data is empty' % code, file = self.log)
                 continue
 
-            fmt_proc = lambda x, y: '\'%%(%s)s\'' % x if y.startswith('varchar') or y == 'date' else '%%(%s)s' % x
-            values_fmt = '(%s)' % ', '.join(fmt_proc(item[0], item[1]) for item in columns_group)
-            def dict_fix(idx, offset):
-                ret = df.ix[idx].to_dict()
-                ret['id'] = idx + offset
+            index_base = df.index[0]
+            def dict_fix(index, offset):
+                ret = df.ix[index].to_dict()
+                ret['id'] = index- index_base + offset
                 return ret
-            values_list = ', '.join(values_fmt % dict_fix(idx, idx_offset) for idx in df.index)
+            dict_list = [dict_fix(index, idx_offset) for index in df.index]
+            ret = self._insert_into_table('trade', dict_list)
+            idx_offset += ret 
 
-            log_filename = 'D:\\log_trade.txt'
-            #if os.path.exists(log_filename):
-            #    os.remove(log_filename)
-
-            with open(log_filename, 'w') as fp:
-                print('\n\n\n\n##### [%s]: insert %d records ######\n' % (code, df.shape[0]), 
-                        '\ndf\n', df, 
-                        '\nvalues_list\n', values_list, 
-                        file = fp)
-
-            self.execute('delete from trade;')
-
-            try:
-                self.cursor.execute('insert into trade values %s;' % values_list)
-                self.db.commit()
-            except Exception as e:
-                self.db.rollback()
-                print('[ERR]:', e)
-                print('[ERR]: commit trade insert at (%s) fail\n' % code)
-                quit()
-            else:
-                idx_offset += df.shape[0]
-                print('[%s]: insert %d records' % (code, df.shape[0]))
+            print('[trade]: insert %d records for code %s from date %s' % (ret, code, start_date))
 
     def _check_table_company(self):
-        self.execute('delete from company;')
-        columns_group = self.execute('desc company')
+        last_year = self.execute('select max(year) from company;')[0][0]
+        if last_year:
+            last_quarter = self.execute('select max(quarter) from company where year = %s;' % last_year)[0][0]
+            if last_quarter == 4:
+                start_year = last_year + 1
+                start_quarter = 1
+            else:
+                start_year = last_year
+                start_quarter = last_quarter + 1
+        else:
+            start_year = 2002
+            start_quarter = 1
 
-        fmt_proc = lambda x, y: '\'%%(%s)s\'' % x if y.startswith('varchar') or y == 'date' else '%%(%s)s' % x
-        values_fmt = '(%s)' % ', '.join(fmt_proc(item[0], item[1]) for item in columns_group)
+        idx_offset = self.execute('select max(id) from company;')[0][0]
+        idx_offset = idx_offset + 1 if idx_offset else 0
 
-        idx_offset = 0
-        for year in (2002,2019):    #range(2002, 2019):
-            for quarter in (1,2,3,4): #range(1,5):
+        for year in range(start_year, 2019):
+            for quarter in range(start_quarter,5):
                 try:
                     df_report = ts.get_report_data(year, quarter)
                     df_profit = ts.get_profit_data(year, quarter)
                     df_growth = ts.get_growth_data(year, quarter)
                     df_debt = ts.get_debtpaying_data(year, quarter)
                 except Exception as e:
-                    print('[ERR]:', e)
-                    print('[ERR]: get company infor at (%d,%d) fail\n' % (year, quarter))
+                    print('[ERR]:', e, file = self.log)
+                    print('[ERR]: get company infor at (%d,%d) fail\n' % (year, quarter), file = self.log)
                     quit()
 
-                values = []
+                dicts = []
                 for idx in df_report.index:
                     def df2dict(df, code):
                         row = df[df.code == code]
@@ -257,7 +245,7 @@ class Database():
                     dic['code'] = code
                     dic['year'] = year
                     dic['quarter'] = quarter
-                    dic['report_date'] = '%s-%s' % (year, dic['report_date'])
+                    dic['report_date'] = '%s-%s' % (year, dic['report_date'] if dic['report_date'] != '02-29' else '02-28')
                     dic['eps'] = dic_profit['eps'] if isinstance(dic_profit['eps'], float) and not numpy.isnan(dic_profit['eps']) else dic_report['eps']
                     dic['roe'] = dic_profit['roe'] if isinstance(dic_profit['roe'], float) and not numpy.isnan(dic_profit['roe']) else dic_report['roe']
                     dic['net_profits'] = dic_profit['net_profits'] if isinstance(dic_profit['net_profits'], float) and not numpy.isnan(dic_profit['net_profits']) else dic_report['net_profits']
@@ -266,34 +254,38 @@ class Database():
                         if isinstance(v, float) and numpy.isnan(v):
                             dic[k] = None
 
-                    values.append(values_fmt % dic)
-                values_list = ', '.join(values).replace('None', 'null')
+                    dicts.append(dic)
+                ret = self._insert_into_table('company', dicts)
+                idx_offset += ret
+                print('\n[company]: insert %d records for year %d quarter %d' % (ret, year, quarter))
 
-                log_filename = 'D:\\log_company.txt'
-                #if os.path.exists(log_filename):
-                #    os.remove(log_filename)
+    def _insert_into_table(self, name, dicts):
+        '''
+        name, table name.
+        dicts, dict list to insert. TODO: better to be a generator.
+        '''
+        columns_group = self.execute('desc %s;' % name)
+        fmt_proc = lambda x, y: '\'%%(%s)s\'' % x if y.startswith('varchar') or y == 'date' else '%%(%s)s' % x
+        values_fmt = '(%s)' % ', '.join(fmt_proc(item[0], item[1]) for item in columns_group)
+        values_list = ', '.join(values_fmt % item for item in dicts).replace('None', 'null')
 
-                with open(log_filename, 'w') as fp:
-                    print('\n\n\n\n##### [%d/%d]: insert %d records ######\n' % (year, quarter, df_report.shape[0]), 
-                            '\ndf_report\n', df_report, 
-                            '\ndf_profit\n', df_profit, 
-                            '\ndf_growth\n', df_growth, 
-                            '\ndf_debt\n', df_debt, 
-                            '\nvalues_list\n', values_list, 
-                            file = fp)
-
-                try:
-                    self.cursor.execute('insert into company values %s;' % values_list)
-                    self.db.commit()
-                except Exception as e:
-                    self.db.rollback()
-                    print('[ERR]:', e)
-                    print('[ERR]: commit company insert at (%d,%d) fail\n' % (year, quarter))
-                    quit()
-                else:
-                    idx_offset += df_report.shape[0]
-                    print('\n[%d/%d]: insert %d records' % (year, quarter, df_report.shape[0]))
-                
+        if self.debug_en:
+            with open(self.debug_files[name], 'w') as fp:
+                print('\n\n\n\n##### _insert_into_table(%s): %d records ######\n' % (name, len(dicts)), 
+                        '\n##dicts##\n', dicts, 
+                        '\n##values_list##\n', values_list, 
+                        file = fp)
+        try:
+            self.cursor.execute('insert into %s values %s;' % (name, values_list))
+            self.db.commit()
+        except Exception as e:
+            self.db.rollback()
+            print('[ERR]:', e)
+            print('[ERR]: _insert_into_table %s fail\n' % name)
+            quit()
+        else:
+            return len(dicts)
+    
     def __enter__(self):
         return self
 
@@ -302,4 +294,7 @@ class Database():
             print('[ERR]:', exc_type, exc_value)
 
         self.db.close()
+        if self.log is not sys.stdout:
+            self.log.close()
+
         return False
